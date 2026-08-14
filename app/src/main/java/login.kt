@@ -35,6 +35,11 @@ class login : ComponentActivity() {
             requestQueue = Volley.newRequestQueue(this)
             connectPhoneApp(uId, uPin)
         }
+
+        val btnSkipLogin = findViewById<Button>(R.id.btnSkipLogin)
+        btnSkipLogin.setOnClickListener {
+            goToServiceSelection()
+        }
     }
 
     private fun connectPhoneApp(uId: String, uPin:String){
