@@ -19,3 +19,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "DemoAssist"
 include(":app")
+include(":sensorlib")

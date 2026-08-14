@@ -1,6 +1,6 @@
 package com.handmonitor.sensorlib.v3.internal
 
-internal data class SensorData(
+data class SensorData(
     val values: FloatArray,
     val type: Int,
     val timestamp: Long

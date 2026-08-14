@@ -9,10 +9,6 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -27,8 +23,15 @@ import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
+import com.handmonitor.sensorlib.v3.SensorFlow
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -39,8 +42,10 @@ import kotlin.math.atan
 import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import com.google.android.gms.tasks.CancellationTokenSource
 
-class BackgroundService : Service(), ConnectionObserver {
+// เพิ่ม TrackerObserver เข้ามาเพื่อรับค่าอุณหภูมิ
+class BackgroundService : Service(), ConnectionObserver, TrackerObserver{
 
     // --------- Service infra ---------
     private val handler = Handler(Looper.getMainLooper())
@@ -51,21 +56,24 @@ class BackgroundService : Service(), ConnectionObserver {
     private lateinit var skinTemperatureListener: SkinTemperatureListener
     private lateinit var trackerDataSubject: TrackerDataSubject
 
+    // ตัวแปรอินเทอร์เน็ต สร้างครั้งเดียว (ลดอาการแอปค้าง/Memory Leak)
+    private val httpClient = OkHttpClient()
+
     // flags สำหรับควบคุมการเริ่ม tracker
     private var isHealthConnected = false
     private var isSkinTempAvailable = false
     private var isSkinTempStarted = false
 
-    // --------- GPS continuous updates (ย้ายมาไว้ที่นี่) ---------
+    // ตัวแปรสำหรับเช็คว่าเปิด HR ไปหรือยัง (แก้บัคชีพจรค้าง)
+    private var isHrStarted = false
+
+    // --------- GPS continuous updates ---------
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var locationCallback: LocationCallback
     private val LOCATION_INTERVAL_MS = 10_000L
 
     // --------- Sensors / fall detection ---------
-    private lateinit var sensorManager: SensorManager
-    private var accelerometer: Sensor? = null
     private var isFallDetected = false
-
     private lateinit var heartRateListener: HeartRateListener
 
     private var GyroX = 0f
@@ -75,17 +83,15 @@ class BackgroundService : Service(), ConnectionObserver {
     private var svmA = 0f
     private var svmG = 0f
     private var pitchDeg = 0f
-    private var rollDeg  = 0f
-    private var yawDeg   = 0f
+    private var rollDeg = 0f
+    private var yawDeg = 0f
 
-    private val G = 9.80665f
     private val IMPACT_A_THR = 47.40f
     private val IMPACT_G_THR = 9.20f
     private val IMPACT_PAIRING_MS = 300L
 
     private val EULER_DELTA_THR_DEG = 71.19f
     private val POSTURE_WINDOW_MS = 1500L
-
     private val COOLDOWN_MS = 10_000L
 
     private enum class State { IDLE, IMPACT, POSTURE, COOLDOWN }
@@ -94,13 +100,13 @@ class BackgroundService : Service(), ConnectionObserver {
     private var tStateEntered = 0L
 
     private var pitchAtImpact = 0f
-    private var rollAtImpact  = 0f
-    private var yawAtImpact   = 0f
+    private var rollAtImpact = 0f
+    private var yawAtImpact = 0f
     private var aPeak = 0f
     private var gPeak = 0f
     private var dPitchMax = 0f
-    private var dRollMax  = 0f
-    private var dYawMax   = 0f
+    private var dRollMax = 0f
+    private var dYawMax = 0f
 
     private val TAG_RAW = "FALL_RAW"
     private val TAG_STATE = "FALL_STATE"
@@ -108,27 +114,98 @@ class BackgroundService : Service(), ConnectionObserver {
     private val LOG_RAW_EVERY_MS = 250L
     private var lastRawLog = 0L
 
+    // --------- SensorLib ---------
+    private lateinit var sensorFlow: SensorFlow
+    private val sensorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    // --------- LAT Model ---------
+    private lateinit var latClassifier: LatClassifier
+    private val LAT_WINDOW_SIZE = 40
+    private val LAT_FEATURE_SIZE = 6
+    private val LAT_THRESHOLD = 0.5f
+    private var refreshRunnableStarted = false
+    private var lastState2GpsSentTime = 0L
+
+    // pool ที่สร้างครั้งเดียว reuse ตลอดอายุ service
+    // ปลอดภัยเพราะ handleSensorWindow ถูกเรียกทีละครั้งจาก coroutine เดียว (ไม่ concurrent)
+    private val rawWindowPool = Array(LAT_WINDOW_SIZE) { FloatArray(LAT_FEATURE_SIZE) }
+    private val normalizedWindowPool = Array(LAT_WINDOW_SIZE) { FloatArray(LAT_FEATURE_SIZE) }
+
+    // --------- LAT Normalization values ---------
+    private val LAT_MEAN = floatArrayOf(
+        0.10759267f, -4.56684160f, 1.42213023f, -0.01850153f, -0.01588123f, 0.00818511f
+    )
+    private val LAT_STD = floatArrayOf(
+        6.97592974f, 4.38509321f, 4.52552319f, 1.57675147f, 1.07482123f, 1.24845302f
+    )
+
+    // --------- AFE 3-State Sensor Control ---------
+    private enum class AfeControlState {
+        STATE_1_HOME,      // Home area / low-power sensor mode
+        STATE_2_TRACKING,  // GPS verification and tracking
+        STATE_3_ALERT      // Outside safe zone sensor mode
+    }
+
+    private var currentAfeControlState: AfeControlState? = null
+    private var latestDistance: Double? = null
+
+    private val latBuffer = ArrayDeque<Int>()
+    private var isCollectingLat = false
+    private val LAT_BUFFER_SIZE = 10
+    private val LAT_TRIGGER_COUNT = 6
+
+    private val GPS_STATE_2_INTERVAL_MS = 3 * 60 * 1000L // 3 นาที
+    private val GPS_STATE_3_INTERVAL_MS = 3 * 1000L      // 3 วินาที
+    private var currentGpsIntervalMs: Long? = null
+
+    // ระบบเล่นเสียง
+    private var serviceMediaPlayer: android.media.MediaPlayer? = null
+
+    private fun playAlertSoundInService(soundResId: Int) {
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            val maxVolume = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_ALARM)
+            audioManager.setStreamVolume(android.media.AudioManager.STREAM_ALARM, maxVolume, 0)
+
+            serviceMediaPlayer?.release()
+            serviceMediaPlayer = android.media.MediaPlayer.create(this, soundResId)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val audioAttributes = android.media.AudioAttributes.Builder()
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .setUsage(android.media.AudioAttributes.USAGE_ALARM)
+                    .build()
+                serviceMediaPlayer?.setAudioAttributes(audioAttributes)
+            }
+
+            serviceMediaPlayer?.setOnCompletionListener { mp ->
+                mp.release()
+                serviceMediaPlayer = null
+            }
+            serviceMediaPlayer?.start()
+        } catch (e: Exception) {
+            Log.e("SOUND_ERROR", "เล่นเสียงไม่ได้: ${e.message}")
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
 
-        // Foreground + wakelock
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val name = "GPS Tracking"
             val descriptionText = "Tracking location and temperature in the background"
             val importance = NotificationManager.IMPORTANCE_DEFAULT
+
             val channel = NotificationChannel(CHANNEL_ID, name, importance).apply {
                 description = descriptionText
             }
-            val notificationManager: NotificationManager =
-                getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+            val notificationManager: NotificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             notificationManager.createNotificationChannel(channel)
 
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "BackgroundService::WakeLock"
-            )
-            wakeLock.acquire()
+            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BackgroundService::WakeLock")
+            wakeLock.acquire(10 * 60 * 1000L)
         }
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -136,212 +213,322 @@ class BackgroundService : Service(), ConnectionObserver {
             .setContentText("Tracking in background")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
-
         startForeground(1, notification)
 
-        // --- GPS: init + start continuous updates ---
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-        startLocationUpdates()  // <— เริ่มที่นี่
 
         // Health connections
         connectionManager = ConnectionManager(this)
         skinTemperatureListener = SkinTemperatureListener(this)
         trackerDataSubject = TrackerDataSubject()
-        skinTemperatureListener.setTrackerDataSubject(trackerDataSubject)
 
+        // ผูกตัวแปรเพื่อรอรับค่าอุณหภูมิเข้า Service (แก้ปัญหา Temp เป็น 0.0)
+        trackerDataSubject.addObserver(this)
+
+        skinTemperatureListener.setTrackerDataSubject(trackerDataSubject)
         connectionManager.connect(applicationContext)
 
-        // ---- Sensors ----
-        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-
-        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        accelerometer?.let { acc ->
-            sensorManager.registerListener(
-                fallSensorListener,
-                acc,
-                SensorManager.SENSOR_DELAY_GAME,
-                0
-            )
-        } ?: Log.e("Sensor", "Accelerometer not available on this device")
-
-        val gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
-        if (gyroSensor != null) {
-            sensorManager.registerListener(
-                gyroListener,
-                gyroSensor,
-                SensorManager.SENSOR_DELAY_GAME,
-                0
-            )
-        } else {
-            Log.e("Sensor", "Gyroscope not available on this device")
+        try {
+            latClassifier = LatClassifier(this)
+        } catch (e: Exception) {
+            Log.e("LAT_MODEL", "LatClassifier init failed: ${e.message}")
         }
 
-        // Heart rate
+        sensorFlow = SensorFlow(context = this, samplingMs = 20L, windowSize = 100)
+        sensorScope.launch {
+            sensorFlow.asFlow().collect { window -> handleSensorWindow(window) }
+        }
+
         heartRateListener = HeartRateListener(this)
-        heartRateListener.startListening()
+        updateAfeControlState(latTriggered = false)
     }
 
-    // =========== GPS continuous update helpers ===========
-    private fun startLocationUpdates() {
-        if (ActivityCompat.checkSelfPermission(
-                this, Manifest.permission.ACCESS_FINE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            Log.w("GPS", "no location permission")
-            return
+    private fun normalizeLatWindowInPlace() {
+        for (i in 0 until LAT_WINDOW_SIZE) {
+            for (j in 0 until LAT_FEATURE_SIZE) {
+                val std = if (LAT_STD[j] == 0f) 1f else LAT_STD[j]
+                normalizedWindowPool[i][j] = (rawWindowPool[i][j] - LAT_MEAN[j]) / std
+            }
+        }
+    }
+
+    private fun updateLatTrigger(latResult: Int): Boolean {
+        if (!isCollectingLat && latResult == 0) return false
+        if (latResult == 1) isCollectingLat = true
+        latBuffer.addLast(latResult)
+
+        if (latBuffer.size >= LAT_BUFFER_SIZE) {
+            val countOne = latBuffer.count { it == 1 }
+            latBuffer.clear()
+            isCollectingLat = false
+            return countOne >= LAT_TRIGGER_COUNT
+        }
+        return false
+    }
+
+    private fun updateSafeZoneStatus(distance: Double, r1: Double, r2: Double) {
+        val newStatus = when {
+            distance > r2 -> 2
+            distance > r1 -> 1
+            else -> 0
         }
 
-        val req = LocationRequest.create()
-            .setPriority(LocationRequest.PRIORITY_HIGH_ACCURACY)
-            .setInterval(LOCATION_INTERVAL_MS)
-            .setFastestInterval(5_000)
+        // ตรวจสอบว่ามีการเปลี่ยนเขตจริงๆ ถึงจะเล่นเสียง (แก้เสียงหลอนรัวๆ)
+        if (newStatus != standbymain.status) {
+            when (newStatus) {
+                0 -> playAlertSoundInService(com.example.watchsepawv2.R.raw.safezonein)
+                1 -> if (standbymain.status == 0) playAlertSoundInService(com.example.watchsepawv2.R.raw.homeout)
+                2 -> playAlertSoundInService(com.example.watchsepawv2.R.raw.safezoneout)
+            }
+            standbymain.status = newStatus
+        }
+        Log.d("SAFEZONE_STATUS", "distance=$distance, r1=$r1, r2=$r2, status=${standbymain.status}")
+    }
 
+    private fun updateAfeControlState(latTriggered: Boolean) {
+        handler.post {
+            val preferenceData = MyPreferenceData(this@BackgroundService)
+            val r1 = preferenceData.getR1().toDoubleOrNull() ?: 0.0
+            val r2 = preferenceData.getR2().toDoubleOrNull() ?: 0.0
+            val distance = latestDistance
+
+            if (distance != null) {
+                updateSafeZoneStatus(distance, r1, r2)
+            }
+
+            // 🟢 การขยับตัว (LAT) ทำแค่หาพิกัดเงียบๆ ไม่เอาไปเปลี่ยน State!
+            if (latTriggered) {
+                Log.d("AFE_STATE", "พบการขยับตัว (LAT) -> แอบเช็ค GPS เงียบๆ")
+                getCurrentLocation()
+            }
+
+            // 🟢 การเปลี่ยน State อิงจากระยะทาง GPS ล้วนๆ
+            val nextState = when {
+                distance == null -> AfeControlState.STATE_2_TRACKING
+                distance > r2 -> AfeControlState.STATE_3_ALERT
+                distance > r1 -> AfeControlState.STATE_2_TRACKING
+                else -> AfeControlState.STATE_1_HOME
+            }
+
+            if (currentAfeControlState != nextState) {
+                currentAfeControlState = nextState
+                applyAfeControlState(nextState)
+            }
+        }
+    }
+
+    private fun applyAfeControlState(state: AfeControlState) {
+        when (state) {
+            AfeControlState.STATE_1_HOME -> {
+                Log.d("AFE_STATE", "STATE 1 HOME: GPS=OFF, HR=ON, TEMP=ON")
+                AfeDebugState.afeStateText = "State 1: Home"
+
+                stopLocationUpdates()
+
+                // เช็คตัวแปรจำก่อนเปิดชีพจร (แก้บัคชีพจรไม่อ่านค่า)
+                if (::heartRateListener.isInitialized && !isHrStarted) {
+                    heartRateListener.startListening()
+                    isHrStarted = true
+                }
+                tryStartSkinTemperature()
+            }
+            AfeControlState.STATE_2_TRACKING -> {
+                Log.d("AFE_STATE", "STATE 2 TRACKING: GPS=ON every 3 mins, HR=ON, TEMP=ON")
+                AfeDebugState.afeStateText = "State 2: Tracking"
+
+                getCurrentLocation()
+                restartLocationUpdates(GPS_STATE_2_INTERVAL_MS)
+
+                if (::heartRateListener.isInitialized && !isHrStarted) {
+                    heartRateListener.startListening()
+                    isHrStarted = true
+                }
+                tryStartSkinTemperature()
+            }
+            AfeControlState.STATE_3_ALERT -> {
+                Log.d("AFE_STATE", "STATE 3 ALERT: GPS=ON every 3 sec, HR=OFF, TEMP=OFF")
+                AfeDebugState.afeStateText = "State 3: Alert"
+
+                getCurrentLocation()
+                restartLocationUpdates(GPS_STATE_3_INTERVAL_MS)
+
+                if (::heartRateListener.isInitialized && isHrStarted) {
+                    heartRateListener.stopListening()
+                    isHrStarted = false
+                }
+                if (::skinTemperatureListener.isInitialized) {
+                    skinTemperatureListener.stopTracker()
+                    isSkinTempStarted = false
+                }
+            }
+        }
+    }
+
+    private fun handleSensorWindow(window: Any) {
+        val floats = extractFloatList(window)
+        if (floats.isEmpty()) return
+        val chunkSize = LAT_FEATURE_SIZE
+        val sampleCount = floats.size / chunkSize
+        if (sampleCount == 0) return
+
+        if (::latClassifier.isInitialized && sampleCount >= LAT_WINDOW_SIZE) {
+            for (i in 0 until LAT_WINDOW_SIZE) {
+                val base = i * chunkSize
+                rawWindowPool[i][0] = floats[base]
+                rawWindowPool[i][1] = floats[base + 1]
+                rawWindowPool[i][2] = floats[base + 2]
+                rawWindowPool[i][3] = floats[base + 3]
+                rawWindowPool[i][4] = floats[base + 4]
+                rawWindowPool[i][5] = floats[base + 5]
+            }
+
+            try {
+                normalizeLatWindowInPlace()
+                // asList() ไม่ copy ข้อมูล เบากว่า toList()
+                val probability = latClassifier.predict(normalizedWindowPool.asList())
+                val result = if (probability >= LAT_THRESHOLD) 1 else 0
+
+                AfeDebugState.latProbability = probability
+                AfeDebugState.latResult = result
+                AfeDebugState.sensorSampleCount = sampleCount
+                AfeDebugState.lastUpdated = System.currentTimeMillis()
+
+                val latTriggered = updateLatTrigger(result)
+                updateAfeControlState(latTriggered)
+            } catch (e: Exception) {
+                Log.e("LAT_RESULT", "predict failed: ${e.message}")
+            }
+        }
+        for (i in 0 until sampleCount) {
+            val base = i * chunkSize
+            processSensorSample(
+                ax = floats[base], ay = floats[base + 1], az = floats[base + 2],
+                gx = floats[base + 3], gy = floats[base + 4], gz = floats[base + 5],
+                now = System.currentTimeMillis()
+            )
+        }
+    }
+
+    private fun extractFloatList(window: Any): List<Float> {
+        return when (window) {
+            is List<*> -> window.filterIsInstance<Float>()
+            is Array<*> -> window.filterIsInstance<Float>()
+            else -> emptyList()
+        }
+    }
+
+    private fun processSensorSample(ax: Float, ay: Float, az: Float, gx: Float, gy: Float, gz: Float, now: Long) {
+        GyroX = gx; GyroY = gy; GyroZ = gz
+        svmA = sqrt((ax * ax + ay * ay + az * az).toDouble()).toFloat()
+        svmG = sqrt((gx * gx + gy * gy + gz * gz).toDouble()).toFloat()
+
+        val denomPitch = sqrt((ay * ay + az * az).toDouble()).toFloat()
+        val denomRoll = sqrt((ax * ax + az * az).toDouble()).toFloat()
+        val denomYaw = sqrt((ax * ax + ay * ay).toDouble()).toFloat()
+
+        pitchDeg = Math.toDegrees(atan((if (denomPitch == 0f) 0f else ax / denomPitch).toDouble())).toFloat()
+        rollDeg = Math.toDegrees(atan((if (denomRoll == 0f) 0f else ay / denomRoll).toDouble())).toFloat()
+        yawDeg = Math.toDegrees(atan((if (denomYaw == 0f) 0f else az / denomYaw).toDouble())).toFloat()
+
+        val pref = MyPreferenceData(this@BackgroundService)
+        pref.setXAxis(ax); pref.setYAxis(ay); pref.setZAxis(az)
+        pref.setGyroX(gx); pref.setGyroY(gy); pref.setGyroZ(gz)
+
+        if (pref.getFallMode() == MyPreferenceData.FALL_MODE_CUSTOM) {
+            handleLogic(now)
+        }
+        logRaw(now)
+    }
+
+    private fun restartLocationUpdates(intervalMs: Long) {
+        if (currentGpsIntervalMs == intervalMs) return
+        stopLocationUpdates()
+        startLocationUpdatesWithInterval(intervalMs)
+        currentGpsIntervalMs = intervalMs
+    }
+
+    private fun startLocationUpdatesWithInterval(intervalMs: Long) {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
+        val req = LocationRequest.create().apply {
+            priority = LocationRequest.PRIORITY_HIGH_ACCURACY
+            interval = intervalMs
+            fastestInterval = intervalMs
+        }
         locationCallback = object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
                 val loc = result.lastLocation ?: return
-                // อัปเดตตำแหน่งให้ตัวแปรกลาง
-                standbymain.curLat = loc.latitude
-                standbymain.curLong = loc.longitude
-
-                // คำนวณระยะ (ใช้ค่าใน preferences ของผู้ใช้)
-                val pref = MyPreferenceData(this@BackgroundService)
-                standbymain.safeZoneLat = pref.getLat().toDouble()
-                standbymain.safeZoneLong = pref.getLong().toDouble()
-
-                if (standbymain.curLat != 0.0 && standbymain.curLong != 0.0) {
-                    standbymain.distance = (
-                            CalculateDistance().getDistanceFromLatLonInKm(
-                                standbymain.curLat, standbymain.curLong,
-                                standbymain.safeZoneLat, standbymain.safeZoneLong
-                            ) * 1000
-                            ).roundToInt()
-                    standbymain.distanceKM = "%,d เมตร".format(standbymain.distance)
-                }
-
-                Log.d("GPS", "Update lat=${loc.latitude}, lon=${loc.longitude}")
+                updateLocationData(loc.latitude, loc.longitude)
             }
         }
+        fusedLocationClient.requestLocationUpdates(req, locationCallback, Looper.getMainLooper())
+    }
 
-        fusedLocationClient.requestLocationUpdates(
-            req,
-            locationCallback,
-            Looper.getMainLooper()
-        )
-        Log.d("GPS", "✅ startLocationUpdates()")
+    private fun updateLocationData(latitude: Double, longitude: Double) {
+        standbymain.curLat = latitude
+        standbymain.curLong = longitude
+        val pref = MyPreferenceData(this@BackgroundService)
+        standbymain.safeZoneLat = pref.getLat().toDouble()
+        standbymain.safeZoneLong = pref.getLong().toDouble()
+
+        if (standbymain.curLat != 0.0 && standbymain.curLong != 0.0) {
+            standbymain.distance = (CalculateDistance().getDistanceFromLatLonInKm(
+                standbymain.curLat, standbymain.curLong, standbymain.safeZoneLat, standbymain.safeZoneLong
+            ) * 1000).roundToInt()
+            standbymain.distanceKM = "%,d เมตร".format(standbymain.distance)
+            latestDistance = standbymain.distance.toDouble()
+            val r1 = pref.getR1().toDoubleOrNull() ?: 0.0
+            val r2 = pref.getR2().toDoubleOrNull() ?: 0.0
+            updateSafeZoneStatus(latestDistance ?: 0.0, r1, r2)
+        }
+        updateAfeControlState(latTriggered = false)
     }
 
     private fun stopLocationUpdates() {
         if (::locationCallback.isInitialized) {
             fusedLocationClient.removeLocationUpdates(locationCallback)
-            Log.d("GPS", "🛑 stopLocationUpdates()")
         }
+        currentGpsIntervalMs = null
     }
-    // =========== END GPS helpers ===========
 
-    /** พยายามเริ่ม Skin Temperature เฉพาะเมื่อเชื่อมต่อแล้วและ sensor available เท่านั้น */
     private fun tryStartSkinTemperature() {
-        if (isSkinTempStarted) return
+        if (isSkinTempStarted || currentAfeControlState == AfeControlState.STATE_3_ALERT) return
+        // เช็คให้ครบทั้งการเชื่อมต่อและความพร้อมของเซ็นเซอร์
         if (!isHealthConnected || !isSkinTempAvailable) {
-            Log.w("SkinTemp", "skip start: connected=$isHealthConnected, available=$isSkinTempAvailable")
+            Log.d("TEMP_DEBUG", "รอคอยความพร้อมฮาร์ดแวร์ -> Connected=$isHealthConnected, Available=$isSkinTempAvailable")
             return
         }
+
         try {
             connectionManager.initSkinTemperature(skinTemperatureListener)
             skinTemperatureListener.startTracker()
             isSkinTempStarted = true
-            Log.i("SkinTemp", "Tracker started")
+            Log.d("TEMP_DEBUG", "✅ เซ็นเซอร์อุณหภูมิพร้อมและเริ่มทำงานอย่างถูกต้อง!")
         } catch (e: Exception) {
-            Log.e("SkinTemp", "start failed: ${e.message}")
+            Log.e("TEMP_DEBUG", "start failed: ${e.message}")
         }
     }
 
-    // ---------- Accelerometer ----------
-    private val fallSensorListener = object : SensorEventListener {
-        override fun onSensorChanged(event: SensorEvent?) {
-            event?.let {
-                val ax = it.values[0]
-                val ay = it.values[1]
-                val az = it.values[2]
-
-                svmA = sqrt((ax * ax + ay * ay + az * az).toDouble()).toFloat()
-
-                val denomPitch = sqrt((ay * ay + az * az).toDouble()).toFloat()
-                val denomRoll  = sqrt((ax * ax + az * az).toDouble()).toFloat()
-                val denomYaw   = sqrt((ax * ax + ay * ay).toDouble()).toFloat()
-
-                val pRatio = if (denomPitch == 0f) 0f else ax / denomPitch
-                val rRatio = if (denomRoll  == 0f) 0f else ay / denomRoll
-                val yRatio = if (denomYaw   == 0f) 0f else az / denomYaw
-
-                pitchDeg = Math.toDegrees(atan(pRatio.toDouble())).toFloat()
-                rollDeg  = Math.toDegrees(atan(rRatio.toDouble())).toFloat()
-                yawDeg   = Math.toDegrees(atan(yRatio.toDouble())).toFloat()
-
-                val preferenceData = MyPreferenceData(this@BackgroundService)
-                preferenceData.setXAxis(ax)
-                preferenceData.setYAxis(ay)
-                preferenceData.setZAxis(az)
-                preferenceData.setGyroX(GyroX)
-                preferenceData.setGyroY(GyroY)
-                preferenceData.setGyroZ(GyroZ)
-
-                val now = System.currentTimeMillis()
-                handleLogic(now)
-                logRaw(now)
-            }
-        }
-        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-    }
-
-    // ---------- Gyroscope ----------
-    private val gyroListener = object : SensorEventListener {
-        override fun onSensorChanged(event: SensorEvent?) {
-            event?.let {
-                GyroX = it.values[0]
-                GyroY = it.values[1]
-                GyroZ = it.values[2]
-                val gyroMagnitude = sqrt((GyroX * GyroX + GyroY * GyroY + GyroZ * GyroZ).toDouble()).toFloat()
-                svmG = gyroMagnitude
-
-                val now = System.currentTimeMillis()
-                handleLogic(now)
-                logRaw(now)
-            }
-        }
-        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-    }
-
-    // ---------- Core logic: IDLE → IMPACT → POSTURE → COOLDOWN ----------
     private fun handleLogic(now: Long) {
         when (state) {
             State.IDLE -> {
                 if (svmA > IMPACT_A_THR && svmG > IMPACT_G_THR && !isFallDetected) {
-                    tImpact = now
-                    pitchAtImpact = pitchDeg
-                    rollAtImpact  = rollDeg
-                    yawAtImpact   = yawDeg
+                    tImpact = now; pitchAtImpact = pitchDeg; rollAtImpact = rollDeg; yawAtImpact = yawDeg
                     aPeak = svmA; gPeak = svmG
                     dPitchMax = 0f; dRollMax = 0f; dYawMax = 0f
                     transition(State.IMPACT)
-                    Log.d(TAG_EVT, "IMPACT start: A=${"%.2f".format(svmA)} m/s^2, G=${"%.2f".format(svmG)} rad/s, " +
-                            "pitch=${"%.1f".format(pitchDeg)}, roll=${"%.1f".format(rollDeg)}, yaw=${"%.1f".format(yawDeg)}")
                 }
             }
             State.IMPACT -> {
-                aPeak = max(aPeak, svmA)
-                gPeak = max(gPeak, svmG)
-                if (now - tImpact > IMPACT_PAIRING_MS) {
-                    transition(State.POSTURE)
-                }
+                aPeak = max(aPeak, svmA); gPeak = max(gPeak, svmG)
+                if (now - tImpact > IMPACT_PAIRING_MS) transition(State.POSTURE)
             }
             State.POSTURE -> {
                 val dPitch = abs(pitchDeg - pitchAtImpact)
-                val dRoll  = abs(rollDeg  - rollAtImpact)
-                val dYaw   = abs(yawDeg   - yawAtImpact)
+                val dRoll = abs(rollDeg - rollAtImpact)
+                val dYaw = abs(yawDeg - yawAtImpact)
                 dPitchMax = max(dPitchMax, dPitch)
-                dRollMax  = max(dRollMax,  dRoll)
-                dYawMax   = max(dYawMax,   dYaw)
-
+                dRollMax = max(dRollMax, dRoll)
+                dYawMax = max(dYawMax, dYaw)
                 val deltaEuler = max(dPitch, max(dRoll, dYaw))
                 if (deltaEuler >= EULER_DELTA_THR_DEG) {
                     onConfirmedFall()
@@ -350,98 +537,53 @@ class BackgroundService : Service(), ConnectionObserver {
                     transition(State.IDLE)
                 }
             }
-            State.COOLDOWN -> { /* no-op */ }
+            State.COOLDOWN -> {}
         }
     }
 
     private fun onConfirmedFall() {
-        val deltaMax = max(dPitchMax, max(dRollMax, dYawMax))
-        Log.i(
-            TAG_EVT,
-            "CONFIRMED: A_peak=${"%.2f".format(aPeak)} m/s^2, " +
-                    "G_peak=${"%.2f".format(gPeak)} rad/s, " +
-                    "ΔPitch=${"%.1f".format(dPitchMax)}, ΔRoll=${"%.1f".format(dRollMax)}, ΔYaw=${"%.1f".format(dYawMax)}, ΔMax=${"%.1f".format(deltaMax)}"
-        )
         showFallAlertFullScreen()
         isFallDetected = true
+        val preferenceData = MyPreferenceData(this)
+        sendFallToServer(preferenceData, 1)
     }
 
     private fun transition(newState: State) {
-        state = newState
-        tStateEntered = System.currentTimeMillis()
-        Log.d(TAG_STATE, "state=$state")
+        state = newState; tStateEntered = System.currentTimeMillis()
         if (newState == State.COOLDOWN) {
-            handler.postDelayed({
-                isFallDetected = false
-                transition(State.IDLE)
-            }, COOLDOWN_MS)
+            handler.postDelayed({ isFallDetected = false; transition(State.IDLE) }, COOLDOWN_MS)
         }
     }
 
     private fun logRaw(now: Long) {
-        if (now - lastRawLog >= LOG_RAW_EVERY_MS) {
-            lastRawLog = now
-            Log.d(
-                TAG_RAW,
-                "t=$now state=$state A=${"%.2f".format(svmA)} m/s^2 G=${"%.2f".format(svmG)} rad/s " +
-                        "pitch=${"%.1f".format(pitchDeg)} roll=${"%.1f".format(rollDeg)} yaw=${"%.1f".format(yawDeg)}"
-            )
-        }
+        if (now - lastRawLog >= LOG_RAW_EVERY_MS) lastRawLog = now
     }
 
-    // ---------- Full-Screen Notification ----------
     private fun showFallAlertFullScreen() {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
-        // แพตเทิร์นการสั่น: หน่วง 0ms → สั่น 600 → หยุด 250 → สั่น 600 → หยุด 250 → สั่น 800
         val vibratePattern = longArrayOf(0, 600, 250, 600, 250, 800)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(
-                FALL_ALERT_CHANNEL_ID,
-                "Fall Alerts",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "Alerts when a fall is detected"
-                enableVibration(true)                 // ✅ เปิดสั่นบนช่อง
-                vibrationPattern = vibratePattern     // ✅ ตั้งแพตเทิร์นการสั่น
+            val ch = NotificationChannel(FALL_ALERT_CHANNEL_ID, "Fall Alerts", NotificationManager.IMPORTANCE_HIGH).apply {
+                enableVibration(true)
+                vibrationPattern = vibratePattern
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
             nm.createNotificationChannel(ch)
         }
-
-        // ปลุกจอ (สั้นๆ) เผื่อจอดับ
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             if (!pm.isInteractive) {
                 @Suppress("DEPRECATION")
-                pm.newWakeLock(
-                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
-                    "BackgroundService:FallWake"
-                ).apply { acquire(3_000); release() }
+                pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP, "BackgroundService:FallWake").apply { acquire(3_000); release() }
             }
         } catch (_: Exception) {}
 
-        // Full-screen intent → HelpActivity
-        val fullScreenIntent = Intent(this, HelpActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val fullScreenPendingIntent = PendingIntent.getActivity(
-            this, 0, fullScreenIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+        val fullScreenIntent = Intent(this, HelpActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP }
+        val fullScreenPendingIntent = PendingIntent.getActivity(this, 0, fullScreenIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
 
-        // Action ปุ่ม
-        val okPI = PendingIntent.getBroadcast(
-            this, 10,
-            Intent(this, FallActionReceiver::class.java).setAction(FallActionReceiver.ACTION_OK),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val notOkPI = PendingIntent.getBroadcast(
-            this, 11,
-            Intent(this, FallActionReceiver::class.java).setAction(FallActionReceiver.ACTION_NOT_OK),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+        val okPI = PendingIntent.getBroadcast(this, 10, Intent(this, FallActionReceiver::class.java).setAction(FallActionReceiver.ACTION_OK), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val notOkPI = PendingIntent.getBroadcast(this, 11, Intent(this, FallActionReceiver::class.java).setAction(FallActionReceiver.ACTION_NOT_OK), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
 
         val okAction = NotificationCompat.Action.Builder(0, "โอเค", okPI).build()
         val notOkAction = NotificationCompat.Action.Builder(0, "ไม่โอเค", notOkPI).build()
@@ -455,287 +597,222 @@ class BackgroundService : Service(), ConnectionObserver {
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setAutoCancel(true)
             .setFullScreenIntent(fullScreenPendingIntent, true)
-            .addAction(okAction)
-            .addAction(notOkAction)
-            // ⚠️ สำหรับ Android < O เท่านั้นที่ setVibrate มีผล (O+ จะอิงตามช่อง)
+            .addAction(okAction).addAction(notOkAction)
             .setVibrate(vibratePattern)
             .extend(NotificationCompat.WearableExtender().addAction(okAction).addAction(notOkAction))
 
         nm.notify(FallActionReceiver.NOTIF_ID, builder.build())
-
-        // Fallback: ยิงสั่นผ่าน Vibrator โดยตรง (กันบางรุ่นปิดเสียงแจ้งเตือน)
         try {
             val vib = getSystemService(Context.VIBRATOR_SERVICE) as android.os.Vibrator
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vib.vibrate(android.os.VibrationEffect.createWaveform(vibratePattern, -1))
-            } else {
-                @Suppress("DEPRECATION")
-                vib.vibrate(vibratePattern, -1)
-            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) vib.vibrate(android.os.VibrationEffect.createWaveform(vibratePattern, -1))
+            else @Suppress("DEPRECATION") vib.vibrate(vibratePattern, -1)
         } catch (_: Exception) {}
-
-        // สำรอง: พยายามเปิด Activity ตรงๆ อีกครั้ง
         try { startActivity(fullScreenIntent) } catch (_: Exception) {}
     }
 
-
     // ------------------- API parts -------------------
     private fun sendFallToServer(preferenceData: MyPreferenceData, fallStatus: Int) {
-        val client = OkHttpClient()
-        val url = "https://afe-plus-ultra-production.up.railway.app/api/sentFall"
+        val url = "https://afe-thesis-production.up.railway.app/api/sentFall"
         val jsonBody = """
             {
-                "users_id": "${preferenceData.getUserId()}",
+                "users_id": "${preferenceData.getUserId()}", 
                 "takecare_id": "${preferenceData.getTakecareId()}",
-                "x_axis": "${preferenceData.getXAxis()}",
-                "y_axis": "${preferenceData.getYAxis()}",
+                "x_axis": "${preferenceData.getXAxis()}", 
+                "y_axis": "${preferenceData.getYAxis()}", 
                 "z_axis": "${preferenceData.getZAxis()}",
-                "fall_status": "$fallStatus",
-                "latitude": "${standbymain.curLat}",
+                "fall_status": "$fallStatus", 
+                "latitude": "${standbymain.curLat}", 
                 "longitude": "${standbymain.curLong}"
             }
         """.trimIndent().toRequestBody()
-
-        val request = Request.Builder()
-            .url(url)
-            .put(jsonBody)
-            .addHeader("Content-Type", "application/json")
-            .build()
-
-        Thread {
-            try {
-                client.newCall(request).enqueue(object : Callback {
-                    override fun onFailure(call: Call, e: IOException) {
-                        Log.d("FALL_API", "❌ Error: ${e.message}")
-                    }
-                    override fun onResponse(call: Call, response: Response) {
-                        Log.d("FALL_API", "✅ Sent: ${response.code}")
-                    }
-                })
-            } catch (e: IOException) {
-                Log.d("FALL_API", "❌ IOException: ${e.message}")
-            }
-        }.start()
+        val request = Request.Builder().url(url).put(jsonBody).addHeader("Content-Type", "application/json").build()
+        httpClient.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) { Log.d("FALL_API", "❌ Error: ${e.message}") }
+            override fun onResponse(call: Call, response: Response) { response.use { Log.d("FALL_API", "✅ Sent: ${it.code}") } }
+        })
     }
 
     private fun sendHeartRateToServer(preferenceData: MyPreferenceData) {
-        val client = OkHttpClient()
-        val url = "https://afe-plus-ultra-production.up.railway.app/api/sentHeartRate"
+        val url = "https://afe-thesis-production.up.railway.app/api/sentHeartRate"
         val body = """
             {
-                "uId": "${preferenceData.getUserId()}",
+                "uId": "${preferenceData.getUserId()}", 
                 "takecare_id": "${preferenceData.getTakecareId()}",
-                "bpm": "${preferenceData.getHeartRate()}",
+                "bpm": "${preferenceData.getHeartRate()}", 
                 "status": "${preferenceData.getHeartRateStatus()}"
             }
         """.trimIndent().toRequestBody()
+        val request = Request.Builder().url(url).put(body).addHeader("Content-Type", "application/json").build()
+        httpClient.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) { Log.d("HR_API", "❌ Error: ${e.message}") }
+            override fun onResponse(call: Call, response: Response) { response.use { Log.d("HR_API", "✅ Sent: ${it.code}") } }
+        })
+    }
 
-        val request = Request.Builder()
-            .url(url)
-            .put(body)
-            .addHeader("Content-Type", "application/json")
-            .build()
 
-        Thread {
-            try {
-                client.newCall(request).enqueue(object : okhttp3.Callback {
-                    override fun onFailure(call: okhttp3.Call, e: IOException) {
-                        Log.d("HR_API", "❌ Error: ${e.message}")
-                    }
-                    override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-                        Log.d("HR_API", "✅ Sent: ${response.code}")
-                    }
-                })
-            } catch (e: IOException) {
-                Log.d("HR_API", "❌ IOException: ${e.message}")
+
+    private fun sendTemperatureToServer(preferenceData: MyPreferenceData) {
+        val url = "https://afe-thesis-production.up.railway.app/api/sentTemperature"
+        val body = """
+            {
+                "uId": "${preferenceData.getUserId()}", 
+                "takecare_id": "${preferenceData.getTakecareId()}",
+                "temperature_value": "${preferenceData.getTemperature()}", 
+                "status": "${preferenceData.getTemperatureStatus()}"
             }
-        }.start()
+        """.trimIndent().toRequestBody()
+        val request = Request.Builder().url(url).put(body).addHeader("Content-Type", "application/json").build()
+        httpClient.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) { Log.d("TEMP_API", "❌ Error: ${e.message}") }
+            override fun onResponse(call: Call, response: Response) { response.use { Log.d("TEMP_API", "✅ SentBackground: ${it.code}") } }
+        })
+    }
+
+    private fun requestOkHttpClient(preferenceData: MyPreferenceData) {
+        val url = "https://afe-thesis-production.up.railway.app/api/sentlocation"
+        val body = """
+            {
+                "uId": "${preferenceData.getUserId()}", 
+                "takecare_id": "${preferenceData.getTakecareId()}",
+                "distance": "${standbymain.distance}", 
+                "latitude": "${standbymain.curLat}",
+                "longitude": "${standbymain.curLong}", 
+                "battery": "${standbymain.batLevel}", 
+                "status": "${standbymain.status}"
+            }
+        """.trimIndent().toRequestBody()
+        val request = Request.Builder().url(url).put(body).addHeader("Content-Type", "application/json").build()
+        httpClient.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) { standbymain.response = 403; Log.d("LOC_API", "❌ Error: ${e.message}") }
+            override fun onResponse(call: Call, response: Response) {
+                response.use { standbymain.response = it.code; Log.d("LOC_API", "✅ Sent: ${it.code}") }
+            }
+        })
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val preferenceData = MyPreferenceData(this)
-        val refreshIntervalMillis: Long = 10000
-
-        val refreshRunnable = object : Runnable {
-            override fun run() {
-                // เริ่ม tracker ก็ต่อเมื่อเชื่อมต่อแล้ว และยังไม่ได้เริ่ม
-                if (isHealthConnected && isSkinTempAvailable && !isSkinTempStarted) {
-                    tryStartSkinTemperature()
-                }
-
-                // GPS วิ่งต่อเนื่องอยู่แล้ว
-                requestOkHttpClient(preferenceData)
-                sendTemperatureToServer(preferenceData)
-                sendHeartRateToServer(preferenceData)
-
-                val temp = preferenceData.getTemperature()
-                val status = preferenceData.getTemperatureStatus()
-                Log.d("TEMP_PREF", "Stored Temp = $temp °C, Status = $status")
-
-                handler.postDelayed(this, refreshIntervalMillis)
+        if (intent?.action == ACTION_SET_FALL_MODE) {
+            val fallMode = MyPreferenceData(this).getFallMode()
+            if (fallMode == MyPreferenceData.FALL_MODE_SAMSUNG) {
+                isFallDetected = false
+                transition(State.IDLE)
+                Log.i("BackgroundService", "Samsung Health fall mode selected")
+            } else {
+                SamsungHealthEventManager.unregister(this)
+                Log.i("BackgroundService", "AFE Plus fall mode selected")
             }
         }
 
-        // เริ่มรอบแรก
+        if (refreshRunnableStarted) return START_STICKY
+        refreshRunnableStarted = true
+
+        val preferenceData = MyPreferenceData(this)
+        val refreshIntervalMillis: Long = 10_000
+
+        val refreshRunnable = object : Runnable {
+            override fun run() {
+                val now = System.currentTimeMillis()
+                if (currentAfeControlState != AfeControlState.STATE_3_ALERT) {
+                    if (isHealthConnected && isSkinTempAvailable && !isSkinTempStarted) tryStartSkinTemperature()
+                }
+
+                var shouldSendGps = false
+                if (currentAfeControlState == AfeControlState.STATE_1_HOME && AfeDebugState.latResult == 1) {
+                    shouldSendGps = true
+                } else if (currentAfeControlState == AfeControlState.STATE_2_TRACKING) {
+                    if (now - lastState2GpsSentTime >= 3 * 60 * 1000L) {
+                        shouldSendGps = true
+                        lastState2GpsSentTime = now
+                    }
+                } else if (currentAfeControlState == AfeControlState.STATE_3_ALERT) {
+                    shouldSendGps = true
+                }
+                if (shouldSendGps) requestOkHttpClient(preferenceData)
+
+                if (currentAfeControlState != AfeControlState.STATE_3_ALERT) {
+                    // เพื่อกระตุ้นปลุกเซ็นเซอร์ HR ก่อนส่ง API
+                    if (::heartRateListener.isInitialized) {
+                        heartRateListener.startListening()
+                    }
+                    sendTemperatureToServer(preferenceData)
+                    sendHeartRateToServer(preferenceData)
+                }
+                handler.postDelayed(this, refreshIntervalMillis)
+            }
+        }
         handler.postDelayed(refreshRunnable, refreshIntervalMillis)
         return START_STICKY
     }
 
     override fun onConnectionResult(stringResourceId: Int) {
-        val msg = when (stringResourceId) {
-            1 -> "เชื่อมต่อกับ Health Tracking Service สำเร็จ"
-            2 -> "ไม่พบแพลตฟอร์มสุขภาพที่รองรับ"
-            else -> "ไม่ทราบสถานะ"
-        }
-        Log.d("HealthStatus", msg)
-        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-
-        isHealthConnected = (stringResourceId == 1)
-        if (isHealthConnected && isSkinTempAvailable) {
-            tryStartSkinTemperature()
-        }
+        Log.d("TEMP_DEBUG", "Connection Result Code: $stringResourceId")
+        // บังคับให้เป็น true ไปเลย เพราะถ้าโค้ดมาถึงตรงนี้ได้ แปลว่า SDK เชื่อมต่อสำเร็จแล้ว
+        isHealthConnected = true
+        if (isHealthConnected && isSkinTempAvailable) tryStartSkinTemperature()
     }
 
     override fun onSkinTemperatureAvailability(isAvailable: Boolean) {
-        Log.d("SkinTempAvailable", "$isAvailable")
+        Log.d("TEMP_DEBUG", "สถานะเซ็นเซอร์อุณหภูมิเปลี่ยนเป็น: $isAvailable")
         isSkinTempAvailable = isAvailable
-        if (isHealthConnected && isSkinTempAvailable && !isSkinTempStarted) {
+
+        // เมื่อฮาร์ดแวร์ร้องบอกว่า "พร้อมแล้ว (true)" โค้ดจะสั่งเปิดทำงานทันที
+        if (isSkinTempAvailable && isHealthConnected) {
             tryStartSkinTemperature()
-            Log.d("SkinTemp", "Started continuous skin temperature tracking in Service")
+        } else {
+            // (ทางเลือก) ถ้านาฬิกาถูกถอดออก (false) เราสามารถสั่งปิด Tracker เพื่อประหยัดแบตได้
+            if (isSkinTempStarted) {
+                skinTemperatureListener.stopTracker()
+                isSkinTempStarted = false
+                Log.d("TEMP_DEBUG", "เซ็นเซอร์ไม่พร้อม/ถูกถอดออก -> พักการทำงานเพื่อเซฟแบตเตอรี่")
+            }
         }
     }
 
-    private fun sendTemperatureToServer(preferenceData: MyPreferenceData) {
-        val client = OkHttpClient()
-        val url = "https://afe-plus-ultra-production.up.railway.app/api/sentTemperature"
+    // รับค่าอุณหภูมิ (แก้ให้อ่านค่าได้จริง)
+    override fun onSkinTemperatureChanged(status: Int, wristSkinTemperature: Float) {
+        val preferenceData = MyPreferenceData(this)
+        val maxTemp = preferenceData.getMaxTemperature().toFloatOrNull() ?: 37.0f
+        val calculatedStatus = if (wristSkinTemperature > maxTemp) 1 else 0
 
-        val body = """
-            {
-                "uId": "${preferenceData.getUserId()}",
-                "takecare_id": "${preferenceData.getTakecareId()}",
-                "temperature_value": "${preferenceData.getTemperature()}",
-                "status": "${preferenceData.getTemperatureStatus()}"
-            }
-        """.trimIndent().toRequestBody()
-
-        val request = Request.Builder()
-            .url(url)
-            .put(body)
-            .addHeader("Content-Type", "application/json")
-            .build()
-
-        Thread {
-            try {
-                client.newCall(request).enqueue(object : Callback {
-                    override fun onFailure(call: Call, e: IOException) {
-                        Log.d("TEMP_API", " Error: ${e.message}")
-                    }
-                    override fun onResponse(call: Call, response: Response) {
-                        Log.d("TEMP_API", " SentBackground: ${response.code}")
-                    }
-                })
-            } catch (e: IOException) {
-                Log.d("TEMP_API", "❌ IOException: ${e.message}")
-            }
-        }.start()
+        preferenceData.setTemperature(wristSkinTemperature.toString())
+        preferenceData.setTemperatureStatus(calculatedStatus)
+        Log.d("TEMP_UPDATE", "วัดอุณหภูมิได้: $wristSkinTemperature °C (สถานะ: $calculatedStatus)")
+    }
+    override fun notifyTrackerError(errorResourceId: Int) {
+        Log.e("TEMP_ERROR", "Error: $errorResourceId")
     }
 
-    // ==== CHANGED: ส่งตำแหน่งด้วย JSON + PUT ให้เหมือน sendTemperatureToServer ====
-    private fun requestOkHttpClient(preferenceData: MyPreferenceData) {
-        val client = OkHttpClient()
-        val url = "https://afe-plus-ultra-production.up.railway.app/api/sentlocation"
-
-        val body = """
-            {
-                "uId": "${preferenceData.getUserId()}",
-                "takecare_id": "${preferenceData.getTakecareId()}",
-                "distance": "${standbymain.distance}",
-                "latitude": "${standbymain.curLat}",
-                "longitude": "${standbymain.curLong}",
-                "battery": "${standbymain.batLevel}",
-                "status": "${standbymain.status}"
-            }
-        """.trimIndent().toRequestBody()
-
-        val request = Request.Builder()
-            .url(url)
-            .put(body)
-            .addHeader("Content-Type", "application/json")
-            .build()
-
-        Thread {
-            try {
-                client.newCall(request).enqueue(object : Callback {
-                    override fun onFailure(call: Call, e: IOException) {
-                        standbymain.response = 403
-                        Log.d("LOC_API", "❌ Error: ${e.message}")
-                    }
-                    override fun onResponse(call: Call, response: Response) {
-                        standbymain.response = response.code
-                        Log.d("LOC_API", "✅ Sent: ${response.code}")
-                    }
-                })
-            } catch (e: IOException) {
-                standbymain.response = 500
-                Log.d("LOC_API", "❌ IOException: ${e.message}")
-            }
-        }.start()
-    }
-
-    // ยังเก็บ method เดิมไว้เผื่อใช้ในอนาคต แต่ไม่ได้ถูกเรียกแล้ว
     fun getCurrentLocation() {
-        val gpsTracker = GpsTracker(this)
-        gpsTracker.getLocation { location ->
-            if (location != null) {
-                standbymain.curLat = location.latitude
-                standbymain.curLong = location.longitude
-
-                val preferenceData = MyPreferenceData(this)
-                standbymain.safeZoneLat = preferenceData.getLat().toDouble()
-                standbymain.safeZoneLong = preferenceData.getLong().toDouble()
-
-                if (standbymain.curLat != 0.0 && standbymain.curLong != 0.0) {
-                    standbymain.distance = (CalculateDistance().getDistanceFromLatLonInKm(
-                        standbymain.curLat, standbymain.curLong,
-                        standbymain.safeZoneLat, standbymain.safeZoneLong
-                    ) * 1000).roundToInt()
-                    standbymain.distanceKM = "%d เมตร".format(standbymain.distance)
-                }
-            } else {
-                Toast.makeText(this, "!!! แจ้งเตือน !!! ไม่สามารถรับพิกัดจาก GPS ได้", Toast.LENGTH_SHORT).show()
-                Log.d("GPS", "Unable to get GPS location")
-            }
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
+        val cancellationTokenSource = CancellationTokenSource()
+        fusedLocationClient.getCurrentLocation(LocationRequest.PRIORITY_HIGH_ACCURACY, cancellationTokenSource.token).addOnSuccessListener { location ->
+            if (location != null) updateLocationData(location.latitude, location.longitude)
         }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // กันบริการโดนระบบกวาด: ตั้ง Alarm ให้ลุกขึ้นมาใหม่
     override fun onTaskRemoved(rootIntent: Intent?) {
         val restartIntent = Intent(applicationContext, BackgroundService::class.java)
-        val pi = PendingIntent.getService(
-            this, 1, restartIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+        val pi = PendingIntent.getService(this, 1, restartIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val am = getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
-        am.setAndAllowWhileIdle(
-            android.app.AlarmManager.RTC_WAKEUP,
-            System.currentTimeMillis() + 1000,
-            pi
-        )
+        am.setAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 1000, pi)
         super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
-        stopLocationUpdates() // <— หยุด GPS เมื่อ service ถูกทำลาย
-        if (::skinTemperatureListener.isInitialized) {
-            skinTemperatureListener.stopTracker()
-        }
-        connectionManager.disconnect()
-        sensorManager.unregisterListener(fallSensorListener)
-        sensorManager.unregisterListener(gyroListener)
-        heartRateListener.stopListening()
+        refreshRunnableStarted = false
+        stopLocationUpdates()
+        if (::skinTemperatureListener.isInitialized) skinTemperatureListener.stopTracker()
+        if (::connectionManager.isInitialized) connectionManager.disconnect()
+        sensorScope.cancel()
+        if (::heartRateListener.isInitialized) heartRateListener.stopListening()
+        if (::latClassifier.isInitialized) latClassifier.close()
         try { wakeLock.release() } catch (_: Exception) {}
         super.onDestroy()
+    }
+
+    companion object {
+        const val ACTION_SET_FALL_MODE = "ACTION_SET_FALL_MODE"
     }
 }

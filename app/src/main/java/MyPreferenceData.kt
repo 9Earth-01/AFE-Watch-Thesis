@@ -18,6 +18,7 @@ class MyPreferenceData (context: Context) {
     private val PREFERENCE_MAX_TEMP = "MAX_TEMP"
     // ตั้งตัวแปรสำหรับ fallactive
     val PREFERENCE_FALL_ACTIVE = "FALL_ACTIVE"
+    val PREFERENCE_FALL_MODE = "FALL_MODE"
     val PREFERENCE_X_AXIS = "x_axis"
     val PREFERENCE_Y_AXIS = "y_axis"
     val PREFERENCE_Z_AXIS = "z_axis"
@@ -207,6 +208,16 @@ class MyPreferenceData (context: Context) {
         return preference.getInt(PREFERENCE_FALL_STATUS, 0)
     }
 
+    fun setFallMode(mode: Int) {
+        val editor = preference.edit()
+        editor.putInt(PREFERENCE_FALL_MODE, mode)
+        editor.apply()
+    }
+
+    fun getFallMode(): Int {
+        return preference.getInt(PREFERENCE_FALL_MODE, FALL_MODE_CUSTOM)
+    }
+
     //ฟังก์ชัน สำหรับ Heart Rate
     fun setHeartRate(rate: String) {
         val editor = preference.edit()
@@ -241,5 +252,8 @@ class MyPreferenceData (context: Context) {
         return preference.getString(PREFERENCE_MIN_HEART_RATE, "50") ?: "50"
     }
 
-
+    companion object {
+        const val FALL_MODE_CUSTOM = 0
+        const val FALL_MODE_SAMSUNG = 1
+    }
 }

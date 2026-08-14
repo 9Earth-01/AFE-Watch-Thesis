@@ -31,6 +31,7 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.util.Log
 import android.widget.Button
@@ -61,6 +62,7 @@ import kotlin.math.roundToInt
 import android.view.GestureDetector
 import android.view.MotionEvent
 import androidx.core.content.ContextCompat
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 
 class standbymain : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvider, TrackerObserver,
     ConnectionObserver {
@@ -69,6 +71,8 @@ class standbymain : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvid
     private lateinit var requestQueue: RequestQueue
     private lateinit var txtTemperature: TextView
     private lateinit var txtTemperatureStatus: TextView
+    private lateinit var txtLatResult: TextView
+    private lateinit var txtAfeState: TextView
     private val appTag = "standbymain"
 
     //    private lateinit var skinTemperatureSubject: TrackerDataSubject
@@ -160,6 +164,12 @@ class standbymain : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvid
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.standbymain)
+
+        txtLatResult = findViewById(R.id.txtLatResult)
+        txtAfeState = findViewById(R.id.txtAfeState)
+        updateLatResultText()
+        updateAfeStateText()
+
 //        txtTemperature = findViewById(R.id.txtTemperature)
 //        txtTemperatureStatus = findViewById(R.id.txtTemperatureStatus)
         // ตั้งค่า gesture detector สำหรับปัดซ้ายไป Heart Rate
@@ -284,9 +294,9 @@ class standbymain : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvid
             builder.show()
         } else {
             //First time for open app.
-           // getCurrentLocation()
+            // getCurrentLocation()
             refreshDisplay(r1, r2)
-           // requestOkHttpClient(preferenceData)
+            // requestOkHttpClient(preferenceData)
 //            updateTemperatureDisplay(preferenceData)
 //            sendTemperatureToServer(preferenceData)
         }
@@ -298,6 +308,8 @@ class standbymain : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvid
 //                updateTemperatureDisplay(preferenceData)
 //                sendTemperatureToServer(preferenceData)
                 refreshDisplay(r1, r2)
+                updateLatResultText()
+                updateAfeStateText()
                 //requestOkHttpClient(preferenceData)
                 handler.postDelayed(this, refreshIntervalMillis)
             }
@@ -315,7 +327,7 @@ class standbymain : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvid
 
 //    private fun sendTemperatureToServer(preferenceData: MyPreferenceData) {
 //        val client = OkHttpClient()
-//        val url = "https://afe-plus-ultra-production.up.railway.app/api/sentTemperature"
+//        val url = "https://afe-thesis-production.up.railway.app/api/sentTemperature"
 //
 //
 //        val body = """
@@ -349,6 +361,25 @@ class standbymain : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvid
 //            }
 //        }.start()
 //    }
+
+    private fun updateLatResultText() {
+        if (!::txtLatResult.isInitialized) return
+
+        val resultText = when (AfeDebugState.latResult) {
+            1 -> "1 สนใจ"
+            0 -> "0 ไม่สนใจ"
+            else -> "-"
+        }
+
+        txtLatResult.text =
+            "LAT: $resultText (${String.format("%.3f", AfeDebugState.latProbability)})"
+    }
+
+    private fun updateAfeStateText() {
+        if (!::txtAfeState.isInitialized) return
+
+        txtAfeState.text = AfeDebugState.afeStateText
+    }
 
     override fun getAmbientCallback(): AmbientModeSupport.AmbientCallback {
         return MyAmbientCallback()
@@ -428,7 +459,7 @@ class standbymain : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvid
     public fun refreshDisplay(r1: Double, r2: Double) {
         val textLatLng = findViewById<TextView>(R.id.txtLatLng)
         val textStatus = findViewById<TextView>(R.id.txtStatus)
-        val textDistance = findViewById<TextView>(R.id.distance)
+//        val textDistance = findViewById<TextView>(R.id.distance)
 
         // แสดงค่าพิกัดปัจจุบัน
         textLatLng.text = "ละติจูด %.3f \nลองจิจูด %.3f".format(curLat, curLong)
@@ -449,10 +480,13 @@ class standbymain : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvid
             }
         }
 
-        textDistance.text = "ระยะห่างจากจุดปลอดภัย\n$distanceKM"
+//        textDistance.text = "ระยะห่างจากจุดปลอดภัย\n$distanceKM"
 
         val batteryManager = applicationContext.getSystemService(BATTERY_SERVICE) as BatteryManager
         batLevel = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+
+        updateLatResultText()
+        updateAfeStateText()
     }
 
     private fun controllSound(id: Int) {
@@ -503,7 +537,7 @@ class standbymain : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvid
     public fun requestOkHttpClient(preferenceData: MyPreferenceData) {
         try {
             val client = OkHttpClient()
-            val url = "https://afe-plus-ultra-production.up.railway.app/api/sentlocation"
+            val url = "https://afe-thesis-production.up.railway.app/api/sentlocation"
             //val mediaType = "application/json".toMediaType()
             val body = """
     {
@@ -515,10 +549,13 @@ class standbymain : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvid
         "battery": "$batLevel",
         "status": "$status"
     }
-""".trimIndent().toRequestBody()
+""".trimIndent()
+
+            val encryptedBody = AesCrypto.encrypt(body).toString()
+                .toRequestBody("application/json".toMediaTypeOrNull())
             val request = Request.Builder()
                 .url(url)
-                .put(body)
+                .put(encryptedBody)
                 .addHeader("Content-Type", "application/json")
                 .build()
             Thread {
@@ -593,7 +630,7 @@ class standbymain : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvid
     //Private
     fun requestSOS(uId: String): Int {
         val client = OkHttpClient()
-        val url = "https://afe-plus-ultra-production.up.railway.app/api/requestSOS"
+        val url = "https://afe-thesis-production.up.railway.app/api/requestSOS"
 //        val body = MultipartBody.Builder().setType(MultipartBody.FORM)
 //            .addFormDataPart("uid",uId.toString())
 //            .build()

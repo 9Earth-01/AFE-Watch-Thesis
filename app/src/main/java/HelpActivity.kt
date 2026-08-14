@@ -22,6 +22,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 
 class HelpActivity : Activity() {
 
@@ -130,7 +131,7 @@ class HelpActivity : Activity() {
     private fun sendFallToServer(preferenceData: MyPreferenceData, fallStatus: Int) {
         Log.d("FALL_API", "ส่งข้อมูลการล้มไป backend (status: $fallStatus)")
         val client = OkHttpClient()
-        val url = "https://afe-plus-ultra-production.up.railway.app/api/sentFall"
+        val url = "https://afe-thesis-production.up.railway.app/api/sentFall"
         val jsonBody = """
             {
                 "users_id": "${preferenceData.getUserId()}",
@@ -142,11 +143,14 @@ class HelpActivity : Activity() {
                 "latitude": "$curLat",
                 "longitude": "$curLong"
             }
-        """.trimIndent().toRequestBody()
+        """.trimIndent()
+
+        val encryptedBody = AesCrypto.encrypt(jsonBody).toString()
+            .toRequestBody("application/json".toMediaTypeOrNull())
 
         val request = Request.Builder()
             .url(url)
-            .put(jsonBody)
+            .put(encryptedBody)
             .addHeader("Content-Type", "application/json")
             .build()
 

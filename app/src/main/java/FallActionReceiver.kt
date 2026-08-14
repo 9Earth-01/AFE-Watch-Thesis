@@ -9,6 +9,7 @@ import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 
 class FallActionReceiver : BroadcastReceiver() {
     companion object {
@@ -35,7 +36,7 @@ class FallActionReceiver : BroadcastReceiver() {
 
         // ส่งไปหลังบ้าน (ตามฟอร์แมตเดียวกับ HelpActivity)
         val client = OkHttpClient()
-        val url = "https://afe-plus-ultra-production.up.railway.app/api/sentFall"
+        val url = "https://afe-thesis-production.up.railway.app/api/sentFall"
         val jsonBody = """
         {
             "users_id": "${pref.getUserId()}",
@@ -47,12 +48,14 @@ class FallActionReceiver : BroadcastReceiver() {
             "latitude": "${standbymain.curLat}",
             "longitude": "${standbymain.curLong}"
         }
-    """.trimIndent().toRequestBody()
+    """.trimIndent()
+
+        val encryptedBody = AesCrypto.encrypt(jsonBody).toString()
+            .toRequestBody("application/json".toMediaTypeOrNull())
 
         val request = Request.Builder()
             .url(url)
-            .put(jsonBody)
-            .addHeader("Content-Type", "application/json")
+            .put(encryptedBody)
             .build()
 
         Thread {

@@ -14,9 +14,9 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import java.util.concurrent.TimeUnit
 
-internal typealias SensorDataListenerCallback = (SensorData) -> Unit
+typealias SensorDataListenerCallback = (SensorData) -> Unit
 
-internal class SensorDataListener(
+class SensorDataListener(
     context: Context,
     val type: Int,
     private val samplingMs: Long,

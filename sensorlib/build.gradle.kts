@@ -1,7 +1,7 @@
 plugins {
-    alias(libs.plugins.android.library)
-    alias(libs.plugins.jetbrains.kotlin.android)
-    alias(libs.plugins.junit5)
+    id("com.android.library")
+    id("org.jetbrains.kotlin.android")
+    id("de.mannodermaus.android-junit5")
 }
 
 android {
